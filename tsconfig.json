@@ -6,10 +6,9 @@
     "module": "ESNext",
     "target": "ES6",
     "allowSyntheticDefaultImports": true,
-    "moduleResolution": "bundler",
-    "importHelpers": true,
-    "isolatedModules": true,
+    "moduleResolution": "node",
     "strictNullChecks": true,
+    "importHelpers": true,
     "lib": ["ES6", "DOM"]
   },
   "include": ["**/*.ts"]

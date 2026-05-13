@@ -1,19 +1,14 @@
 {
   "name": "gdrive-vault-sync",
   "version": "1.0.0",
-  "description": "Obsidian plugin — syncs vault to Google Drive",
+  "description": "Obsidian plugin to sync vault with Google Drive",
   "main": "main.js",
   "scripts": {
-    "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs"
   },
-  "keywords": [],
-  "author": "JanakaProjects",
-  "license": "MIT",
   "devDependencies": {
     "@types/node": "^16.11.6",
-    "@typescript-eslint/eslint-plugin": "5.29.0",
-    "@typescript-eslint/parser": "5.29.0",
     "builtin-modules": "3.3.0",
     "esbuild": "0.17.3",
     "obsidian": "latest",
