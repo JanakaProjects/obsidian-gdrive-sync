@@ -92,7 +92,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   onunload() {
     this.stopAutoSync();
   }
-  // ── Auto-Updater ────────────────────────────────────────────────────────
+  // ── Auto-Updater ───────────────────────────────────────────────────────
   async checkForUpdate() {
     try {
       const resp = await (0, import_obsidian.requestUrl)({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
@@ -145,7 +145,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     const current = (_a = await this.loadData()) != null ? _a : {};
     await this.saveData({ ...current, lastSynced: this.lastSynced });
   }
-  // ── OAuth ─────────────────────────────────────────────────────────────────
+  // ── OAuth ────────────────────────────────────────────────────────────────
   async getAccessToken() {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 6e4)
       return this.accessToken;
@@ -187,24 +187,22 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     this.driveFolderId = folder.id;
     return this.driveFolderId;
   }
-  // ── List ALL files on Drive (handles pagination properly) ───────────────────
+  // ── List ALL files on Drive ─────────────────────────────────────────────────
   async listDriveFiles() {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
     let allFiles = [];
     let pageToken = null;
-    let page = 1;
     do {
-      let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&fields=nextPageToken,files(id,name,modifiedTime)&pageSize=100`;
+      let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&fields=nextPageToken,files(id,name,modifiedTime)`;
       if (pageToken)
         url += `&pageToken=${encodeURIComponent(pageToken)}`;
       const resp = await fetch(url, { headers: { Authorization: "Bearer " + token } });
       if (!resp.ok)
-        throw new Error(`Drive list failed page ${page}: ${resp.status}`);
+        throw new Error(`Drive list failed: ${resp.status} ${await resp.text()}`);
       const data = await resp.json();
       allFiles = allFiles.concat(data.files || []);
       pageToken = data.nextPageToken || null;
-      page++;
     } while (pageToken);
     return allFiles;
   }
@@ -256,7 +254,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
             }
           }
         }));
-        this.setStatus(`\u2B07\uFE0F ${downloaded} downloaded...`);
+        this.setStatus(`\u2B07\uFE0F ${downloaded}/${driveEntries.length}...`);
       }
       const localFiles = this.app.vault.getFiles();
       const toUpload = localFiles.filter((f) => {
@@ -268,7 +266,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         const batch = toUpload.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map((f) => this.uploadFile(f, true)));
         uploaded += batch.length;
-        this.setStatus(`\u2B06\uFE0F ${uploaded}/${toUpload.length} uploaded...`);
+        this.setStatus(`\u2B06\uFE0F ${uploaded}/${toUpload.length}...`);
       }
       await this.saveLastSynced();
       this.setStatus(`\u2705 \u2B07${downloaded} \u2B06${uploaded} \u2014 ${new Date().toLocaleTimeString()}`);
