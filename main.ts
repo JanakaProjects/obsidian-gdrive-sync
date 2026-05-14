@@ -45,7 +45,7 @@ export default class GDriveSyncPlugin extends Plugin {
     this.statusBarItem = this.addStatusBarItem();
     this.setStatus("⏸ GDrive Sync idle");
 
-    this.addCommand({ id: "sync-now", name: "Sync vault now", callback: () => this.syncAll() });
+    this.addCommand({ id: "sync-now", name: "Sync vault now", callback: () => this.fullTwoWaySync() });
     this.addCommand({ id: "stop-sync", name: "Stop auto-sync", callback: () => this.stopAutoSync() });
     this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
 
@@ -65,7 +65,7 @@ export default class GDriveSyncPlugin extends Plugin {
 
   onunload() { this.stopAutoSync(); }
 
-  // ── Auto-Updater (uses Node fs — works on Obsidian desktop) ──────────────────
+  // ── Auto-Updater ─────────────────────────────────────────────────────────
   async checkForUpdate() {
     try {
       const resp = await requestUrl({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
@@ -81,22 +81,27 @@ export default class GDriveSyncPlugin extends Plugin {
 
   async selfUpdate(newVersion: string) {
     try {
-      // Get the absolute path to the plugin folder using Node.js path
-      // @ts-ignore
-      const basePath = (this.app.vault.adapter as any).basePath;
-      const pluginDir = path.join(basePath, ".obsidian", "plugins", this.manifest.id);
-
-      // Fetch new main.js from GitHub
-      const jsResp = await requestUrl({ url: GITHUB_MAIN_JS_URL + "?t=" + Date.now() });
-      fs.writeFileSync(path.join(pluginDir, "main.js"), jsResp.text, "utf8");
-
-      // Fetch new manifest.json from GitHub
-      const manifestResp = await requestUrl({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
-      fs.writeFileSync(path.join(pluginDir, "manifest.json"), manifestResp.text, "utf8");
+      // Try Node.js fs first (desktop)
+      let usedFs = false;
+      try {
+        // @ts-ignore
+        const basePath = (this.app.vault.adapter as any).basePath;
+        const pluginDir = path.join(basePath, ".obsidian", "plugins", this.manifest.id);
+        const jsResp = await requestUrl({ url: GITHUB_MAIN_JS_URL + "?t=" + Date.now() });
+        fs.writeFileSync(path.join(pluginDir, "main.js"), jsResp.text, "utf8");
+        const manifestResp = await requestUrl({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
+        fs.writeFileSync(path.join(pluginDir, "manifest.json"), manifestResp.text, "utf8");
+        usedFs = true;
+      } catch (fsErr) {
+        // Fallback: use vault adapter (mobile/iSH)
+        const pluginPath = `.obsidian/plugins/${this.manifest.id}`;
+        const jsResp = await requestUrl({ url: GITHUB_MAIN_JS_URL + "?t=" + Date.now() });
+        await this.app.vault.adapter.write(`${pluginPath}/main.js`, jsResp.text);
+        const manifestResp = await requestUrl({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
+        await this.app.vault.adapter.write(`${pluginPath}/manifest.json`, manifestResp.text);
+      }
 
       new Notice(`✅ GDrive Sync updated to v${newVersion}! Reloading...`);
-
-      // Reload plugin
       const id = this.manifest.id;
       // @ts-ignore
       await this.app.plugins.disablePlugin(id);
@@ -119,7 +124,7 @@ export default class GDriveSyncPlugin extends Plugin {
     await this.saveData({ ...current, lastSynced: this.lastSynced });
   }
 
-  // ── OAuth ──────────────────────────────────────────────────────────────
+  // ── OAuth ─────────────────────────────────────────────────────────────────
   async getAccessToken(): Promise<string> {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 60000) return this.accessToken;
     const resp = await fetch("https://oauth2.googleapis.com/token", {
@@ -139,7 +144,7 @@ export default class GDriveSyncPlugin extends Plugin {
     return this.accessToken;
   }
 
-  // ── Drive Folder ─────────────────────────────────────────────────────────
+  // ── Drive Folder ──────────────────────────────────────────────────────────
   async ensureDriveFolder(): Promise<string> {
     if (this.driveFolderId) return this.driveFolderId;
     const token = await this.getAccessToken();
@@ -156,7 +161,86 @@ export default class GDriveSyncPlugin extends Plugin {
     return this.driveFolderId;
   }
 
-  // ── Upload single file ───────────────────────────────────────────────────
+  // ── List all files on Drive ───────────────────────────────────────────────
+  async listDriveFiles(): Promise<{id: string, name: string, modifiedTime: string}[]> {
+    const token = await this.getAccessToken();
+    const folderId = await this.ensureDriveFolder();
+    let files: any[] = [];
+    let pageToken = "";
+    do {
+      const url = `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents+and+trashed%3Dfalse&fields=nextPageToken,files(id,name,modifiedTime)&pageSize=1000${pageToken ? "&pageToken=" + pageToken : ""}`;
+      const data = await (await fetch(url, { headers: { Authorization: "Bearer " + token } })).json();
+      files = files.concat(data.files || []);
+      pageToken = data.nextPageToken || "";
+    } while (pageToken);
+    return files;
+  }
+
+  // ── Two-way sync on open ──────────────────────────────────────────────────
+  async fullTwoWaySync() {
+    if (!this.isConfigured()) { new Notice("⚠️ GDrive Sync: Please enter credentials first."); return; }
+    if (this.isSyncing) return;
+    this.isSyncing = true;
+    this.setStatus("🔄 Syncing...");
+    try {
+      await this.ensureDriveFolder();
+
+      // Step 1: Get all Drive files
+      const driveFiles = await this.listDriveFiles();
+      const driveMap: Record<string, {id: string, modifiedTime: number}> = {};
+      for (const df of driveFiles) {
+        const realPath = df.name.replace(/___/g, "/");
+        driveMap[realPath] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
+      }
+
+      // Step 2: Download files newer on Drive than local
+      const token = await this.getAccessToken();
+      let downloaded = 0;
+      for (const [filePath, driveInfo] of Object.entries(driveMap)) {
+        const localFile = this.app.vault.getAbstractFileByPath(filePath);
+        const localMtime = localFile instanceof TFile ? localFile.stat.mtime : 0;
+        if (driveInfo.modifiedTime > localMtime) {
+          const buffer = await (await fetch(`https://www.googleapis.com/drive/v3/files/${driveInfo.id}?alt=media`, { headers: { Authorization: "Bearer " + token } })).arrayBuffer();
+          const dir = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : null;
+          if (dir) { try { await this.app.vault.createFolder(dir); } catch {} }
+          try {
+            if (localFile instanceof TFile) await this.app.vault.modifyBinary(localFile, buffer);
+            else await this.app.vault.createBinary(filePath, buffer);
+            downloaded++;
+          } catch {}
+        }
+      }
+
+      // Step 3: Upload local files newer than Drive
+      const localFiles = this.app.vault.getFiles();
+      const toUpload = localFiles.filter(f => {
+        const driveInfo = driveMap[f.path];
+        if (!driveInfo) return true; // not on Drive at all
+        return f.stat.mtime > driveInfo.modifiedTime; // local is newer
+      });
+
+      let uploaded = 0;
+      for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
+        const batch = toUpload.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map(f => this.uploadFile(f, true)));
+        uploaded += batch.length;
+        this.setStatus(`🔄 Syncing ${uploaded}/${toUpload.length}...`);
+      }
+
+      await this.saveLastSynced();
+      const summary = `⬇${downloaded} ⬆${uploaded}`;
+      this.setStatus(`✅ Synced ${summary} — ${new Date().toLocaleTimeString()}`);
+      if (downloaded > 0 || uploaded > 0) {
+        new Notice(`✅ GDrive Sync: ⬇ ${downloaded} downloaded, ⬆ ${uploaded} uploaded`);
+      }
+    } catch (e) {
+      this.setStatus("❌ Sync failed");
+      new Notice("❌ GDrive Sync failed: " + e.message);
+    }
+    this.isSyncing = false;
+  }
+
+  // ── Upload single file ────────────────────────────────────────────────────
   async uploadFile(file: TFile, force = false) {
     if (!this.isConfigured()) return;
     if (!force && this.lastSynced[file.path] && this.lastSynced[file.path] >= file.stat.mtime) return;
@@ -182,66 +266,36 @@ export default class GDriveSyncPlugin extends Plugin {
     }
   }
 
-  // ── Delete from Drive ────────────────────────────────────────────────────
-  async deleteFromDrive(path: string) {
+  // ── Delete from Drive ─────────────────────────────────────────────────────
+  async deleteFromDrive(filePath: string) {
     if (!this.isConfigured()) return;
     try {
       const token = await this.getAccessToken();
       const folderId = await this.ensureDriveFolder();
-      const safeName = path.replace(/\//g, "___");
+      const safeName = filePath.replace(/\//g, "___");
       const query = encodeURIComponent(`name='${safeName}' and '${folderId}' in parents and trashed=false`);
       const searchData = await (await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)`, { headers: { Authorization: "Bearer " + token } })).json();
       if (searchData.files?.[0]?.id) {
         await fetch(`https://www.googleapis.com/drive/v3/files/${searchData.files[0].id}`, { method: "DELETE", headers: { Authorization: "Bearer " + token } });
-        delete this.lastSynced[path];
+        delete this.lastSynced[filePath];
         await this.saveLastSynced();
       }
     } catch (e) { console.error("GDrive delete error:", e); }
   }
 
-  // ── Full vault sync — parallel batches of 10 ──────────────────────────────
+  // ── Upload-only sync (legacy) ─────────────────────────────────────────────
   async syncAll() {
-    if (!this.isConfigured()) { new Notice("⚠️ GDrive Sync: Please enter credentials first."); return; }
-    if (this.isSyncing) return;
-    this.isSyncing = true;
-    this.setStatus("🔄 Checking for changes...");
-    try {
-      await this.ensureDriveFolder();
-      const files = this.app.vault.getFiles();
-      const changed = files.filter(f => !this.lastSynced[f.path] || this.lastSynced[f.path] < f.stat.mtime);
-      if (changed.length === 0) {
-        this.setStatus("✅ Already up to date — " + new Date().toLocaleTimeString());
-        this.isSyncing = false;
-        return;
-      }
-      new Notice(`GDrive Sync: Uploading ${changed.length} file(s)...`);
-      let done = 0;
-      for (let i = 0; i < changed.length; i += BATCH_SIZE) {
-        const batch = changed.slice(i, i + BATCH_SIZE);
-        await Promise.all(batch.map(f => this.uploadFile(f, true)));
-        done += batch.length;
-        this.setStatus(`🔄 Syncing ${done}/${changed.length}...`);
-      }
-      await this.saveLastSynced();
-      this.setStatus(`✅ Synced ${done} file(s) — ${new Date().toLocaleTimeString()}`);
-      new Notice(`✅ GDrive Sync: ${done} file(s) uploaded!`);
-    } catch (e) {
-      this.setStatus("❌ Sync failed");
-      new Notice("❌ GDrive Sync failed: " + e.message);
-    }
-    this.isSyncing = false;
+    return this.fullTwoWaySync();
   }
 
-  // ── Download from Drive ──────────────────────────────────────────────────
+  // ── Download all from Drive ───────────────────────────────────────────────
   async downloadAll() {
     if (!this.isConfigured()) { new Notice("⚠️ Please enter credentials first."); return; }
     this.setStatus("⬇️ Downloading from Drive...");
     new Notice("GDrive Sync: Downloading vault from Drive...");
     try {
       const token = await this.getAccessToken();
-      const folderId = await this.ensureDriveFolder();
-      const listData = await (await fetch(`https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents+and+trashed%3Dfalse&fields=files(id,name)&pageSize=1000`, { headers: { Authorization: "Bearer " + token } })).json();
-      const driveFiles = listData.files || [];
+      const driveFiles = await this.listDriveFiles();
       let count = 0;
       for (const df of driveFiles) {
         const realPath = df.name.replace(/___/g, "/");
@@ -265,8 +319,8 @@ export default class GDriveSyncPlugin extends Plugin {
 
   startAutoSync() {
     this.stopAutoSync();
-    this.syncAll();
-    this.syncIntervalId = window.setInterval(() => this.syncAll(), this.settings.syncIntervalSeconds * 1000);
+    this.fullTwoWaySync();
+    this.syncIntervalId = window.setInterval(() => this.fullTwoWaySync(), this.settings.syncIntervalSeconds * 1000);
     this.setStatus("🔄 Auto-sync active");
     new Notice("✅ GDrive Auto-Sync started!");
   }
@@ -303,8 +357,8 @@ class GDriveSyncSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "Actions" });
     new Setting(containerEl).setName("Start auto-sync").addButton((b) => b.setButtonText("▶ Start").setCta().onClick(() => this.plugin.startAutoSync()));
     new Setting(containerEl).setName("Stop auto-sync").addButton((b) => b.setButtonText("⏸ Stop").onClick(() => this.plugin.stopAutoSync()));
-    new Setting(containerEl).setName("Sync now").addButton((b) => b.setButtonText("🔄 Upload Changes").onClick(() => this.plugin.syncAll()));
-    new Setting(containerEl).setName("Download from Drive").addButton((b) => b.setButtonText("⬇ Download All").onClick(() => this.plugin.downloadAll()));
+    new Setting(containerEl).setName("Sync now").setDesc("Upload local changes and download Drive changes.").addButton((b) => b.setButtonText("🔄 Two-Way Sync").onClick(() => this.plugin.fullTwoWaySync()));
+    new Setting(containerEl).setName("Download from Drive").setDesc("Force download all files from Drive.").addButton((b) => b.setButtonText("⬇ Download All").onClick(() => this.plugin.downloadAll()));
     new Setting(containerEl).setName("Check for update").setDesc("Manually check GitHub for a newer version.").addButton((b) => b.setButtonText("🔄 Check Update").onClick(() => this.plugin.checkForUpdate()));
   }
 }
