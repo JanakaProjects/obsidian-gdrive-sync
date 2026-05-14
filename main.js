@@ -92,6 +92,68 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   onunload() {
     this.stopAutoSync();
   }
+  // ── Helper: use requestUrl for all HTTP (works on desktop + mobile/iSH) ──────
+  async apiGet(url, token) {
+    const resp = await (0, import_obsidian.requestUrl)({ url, headers: { Authorization: "Bearer " + token } });
+    if (resp.status >= 400)
+      throw new Error(`GET ${url} failed: ${resp.status} ${resp.text}`);
+    return JSON.parse(resp.text);
+  }
+  async apiPost(url, token, body) {
+    const resp = await (0, import_obsidian.requestUrl)({
+      url,
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (resp.status >= 400)
+      throw new Error(`POST ${url} failed: ${resp.status} ${resp.text}`);
+    return JSON.parse(resp.text);
+  }
+  async apiDelete(url, token) {
+    await (0, import_obsidian.requestUrl)({ url, method: "DELETE", headers: { Authorization: "Bearer " + token } });
+  }
+  async apiDownload(url, token) {
+    const resp = await (0, import_obsidian.requestUrl)({ url, headers: { Authorization: "Bearer " + token } });
+    if (resp.status >= 400)
+      throw new Error(`Download failed: ${resp.status}`);
+    return resp.arrayBuffer;
+  }
+  async apiUpload(url, method, token, metadata, content) {
+    const boundary = "gdrivesync_boundary_" + Date.now();
+    const metaStr = JSON.stringify(metadata);
+    const enc = new TextEncoder();
+    const metaPart = enc.encode(
+      `--${boundary}\r
+Content-Type: application/json; charset=UTF-8\r
+\r
+${metaStr}\r
+`
+    );
+    const filePart = enc.encode(`--${boundary}\r
+Content-Type: application/octet-stream\r
+\r
+`);
+    const closing = enc.encode(`\r
+--${boundary}--`);
+    const body = new Uint8Array(metaPart.byteLength + filePart.byteLength + content.byteLength + closing.byteLength);
+    body.set(metaPart, 0);
+    body.set(filePart, metaPart.byteLength);
+    body.set(new Uint8Array(content), metaPart.byteLength + filePart.byteLength);
+    body.set(closing, metaPart.byteLength + filePart.byteLength + content.byteLength);
+    const resp = await (0, import_obsidian.requestUrl)({
+      url,
+      method,
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": `multipart/related; boundary=${boundary}`
+      },
+      body: body.buffer
+    });
+    if (resp.status >= 400)
+      throw new Error(`Upload failed: ${resp.status} ${resp.text}`);
+    return JSON.parse(resp.text);
+  }
   // ── Auto-Updater ───────────────────────────────────────────────────────
   async checkForUpdate() {
     try {
@@ -140,16 +202,20 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   setStatus(msg) {
     this.statusBarItem.setText(msg);
   }
+  errMsg(e) {
+    return (e instanceof Error ? e.message : String(e)) || "Unknown error";
+  }
   async saveLastSynced() {
     var _a;
     const current = (_a = await this.loadData()) != null ? _a : {};
     await this.saveData({ ...current, lastSynced: this.lastSynced });
   }
-  // ── OAuth ────────────────────────────────────────────────────────────────
+  // ── OAuth (uses requestUrl — works on all platforms) ──────────────────────
   async getAccessToken() {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 6e4)
       return this.accessToken;
-    const resp = await fetch("https://oauth2.googleapis.com/token", {
+    const resp = await (0, import_obsidian.requestUrl)({
+      url: "https://oauth2.googleapis.com/token",
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -157,11 +223,13 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         client_secret: this.settings.clientSecret,
         refresh_token: this.settings.refreshToken,
         grant_type: "refresh_token"
-      })
+      }).toString()
     });
-    if (!resp.ok)
-      throw new Error("Failed to refresh token: " + await resp.text());
-    const data = await resp.json();
+    if (resp.status >= 400)
+      throw new Error("Failed to refresh token: " + resp.text);
+    const data = JSON.parse(resp.text);
+    if (!data.access_token)
+      throw new Error("No access_token in response: " + resp.text);
     this.accessToken = data.access_token;
     this.accessTokenExpiry = Date.now() + data.expires_in * 1e3;
     return this.accessToken;
@@ -173,21 +241,23 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       return this.driveFolderId;
     const token = await this.getAccessToken();
     const name = this.settings.driveFolderName;
-    const query = encodeURIComponent(`name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
-    const searchData = await (await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name)`, { headers: { Authorization: "Bearer " + token } })).json();
+    const query = `name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    const searchData = await this.apiGet(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)`,
+      token
+    );
     if (((_a = searchData.files) == null ? void 0 : _a.length) > 0) {
       this.driveFolderId = searchData.files[0].id;
       return this.driveFolderId;
     }
-    const folder = await (await fetch("https://www.googleapis.com/drive/v3/files", {
-      method: "POST",
-      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-      body: JSON.stringify({ name, mimeType: "application/vnd.google-apps.folder" })
-    })).json();
+    const folder = await this.apiPost("https://www.googleapis.com/drive/v3/files", token, {
+      name,
+      mimeType: "application/vnd.google-apps.folder"
+    });
     this.driveFolderId = folder.id;
     return this.driveFolderId;
   }
-  // ── List ALL files on Drive ─────────────────────────────────────────────────
+  // ── List ALL files on Drive (no limit, paginated) ─────────────────────────
   async listDriveFiles() {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -197,10 +267,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&fields=nextPageToken,files(id,name,modifiedTime)`;
       if (pageToken)
         url += `&pageToken=${encodeURIComponent(pageToken)}`;
-      const resp = await fetch(url, { headers: { Authorization: "Bearer " + token } });
-      if (!resp.ok)
-        throw new Error(`Drive list failed: ${resp.status} ${await resp.text()}`);
-      const data = await resp.json();
+      const data = await this.apiGet(url, token);
       allFiles = allFiles.concat(data.files || []);
       pageToken = data.nextPageToken || null;
     } while (pageToken);
@@ -233,24 +300,25 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
           const localFile = this.app.vault.getAbstractFileByPath(filePath);
           const localMtime = localFile instanceof import_obsidian.TFile ? localFile.stat.mtime : 0;
           if (driveInfo.modifiedTime > localMtime) {
-            const buffer = await (await fetch(
-              `https://www.googleapis.com/drive/v3/files/${driveInfo.id}?alt=media`,
-              { headers: { Authorization: "Bearer " + token } }
-            )).arrayBuffer();
-            const dir = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : null;
-            if (dir) {
-              try {
-                await this.app.vault.createFolder(dir);
-              } catch (e) {
-              }
-            }
             try {
+              const buffer = await this.apiDownload(
+                `https://www.googleapis.com/drive/v3/files/${driveInfo.id}?alt=media`,
+                token
+              );
+              const dir = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : null;
+              if (dir) {
+                try {
+                  await this.app.vault.createFolder(dir);
+                } catch (e) {
+                }
+              }
               if (localFile instanceof import_obsidian.TFile)
                 await this.app.vault.modifyBinary(localFile, buffer);
               else
                 await this.app.vault.createBinary(filePath, buffer);
               downloaded++;
             } catch (e) {
+              console.error("Download error:", filePath, this.errMsg(e));
             }
           }
         }));
@@ -275,7 +343,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       }
     } catch (e) {
       this.setStatus("\u274C Sync failed");
-      new import_obsidian.Notice("\u274C GDrive Sync failed: " + e.message);
+      new import_obsidian.Notice("\u274C GDrive Sync failed: " + this.errMsg(e));
     }
     this.isSyncing = false;
   }
@@ -291,18 +359,18 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       const folderId = await this.ensureDriveFolder();
       const content = await this.app.vault.readBinary(file);
       const safeName = file.path.replace(/\//g, "___");
-      const query = encodeURIComponent(`name='${safeName}' and '${folderId}' in parents and trashed=false`);
-      const searchData = await (await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)`, { headers: { Authorization: "Bearer " + token } })).json();
+      const query = `name='${safeName}' and '${folderId}' in parents and trashed=false`;
+      const searchData = await this.apiGet(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`,
+        token
+      );
       const existingId = (_b = (_a = searchData.files) == null ? void 0 : _a[0]) == null ? void 0 : _b.id;
       const metadata = { name: safeName, ...existingId ? {} : { parents: [folderId] } };
-      const form = new FormData();
-      form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-      form.append("file", new Blob([content]));
-      const url = existingId ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart` : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
-      await fetch(url, { method: existingId ? "PATCH" : "POST", headers: { Authorization: "Bearer " + token }, body: form });
+      const uploadUrl = existingId ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart` : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
+      await this.apiUpload(uploadUrl, existingId ? "PATCH" : "POST", token, metadata, content);
       this.lastSynced[file.path] = file.stat.mtime;
     } catch (e) {
-      console.error("GDrive upload error:", file.path, e);
+      console.error("GDrive upload error:", file.path, this.errMsg(e));
     }
   }
   // ── Delete from Drive ─────────────────────────────────────────────────────
@@ -314,15 +382,18 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       const token = await this.getAccessToken();
       const folderId = await this.ensureDriveFolder();
       const safeName = filePath.replace(/\//g, "___");
-      const query = encodeURIComponent(`name='${safeName}' and '${folderId}' in parents and trashed=false`);
-      const searchData = await (await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)`, { headers: { Authorization: "Bearer " + token } })).json();
+      const query = `name='${safeName}' and '${folderId}' in parents and trashed=false`;
+      const searchData = await this.apiGet(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`,
+        token
+      );
       if ((_b = (_a = searchData.files) == null ? void 0 : _a[0]) == null ? void 0 : _b.id) {
-        await fetch(`https://www.googleapis.com/drive/v3/files/${searchData.files[0].id}`, { method: "DELETE", headers: { Authorization: "Bearer " + token } });
+        await this.apiDelete(`https://www.googleapis.com/drive/v3/files/${searchData.files[0].id}`, token);
         delete this.lastSynced[filePath];
         await this.saveLastSynced();
       }
     } catch (e) {
-      console.error("GDrive delete error:", e);
+      console.error("GDrive delete error:", this.errMsg(e));
     }
   }
   syncAll() {
@@ -342,18 +413,18 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         const batch = driveFiles.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (df) => {
           const realPath = df.name.replace(/___/g, "/");
-          const buffer = await (await fetch(
-            `https://www.googleapis.com/drive/v3/files/${df.id}?alt=media`,
-            { headers: { Authorization: "Bearer " + token } }
-          )).arrayBuffer();
-          const dir = realPath.includes("/") ? realPath.substring(0, realPath.lastIndexOf("/")) : null;
-          if (dir) {
-            try {
-              await this.app.vault.createFolder(dir);
-            } catch (e) {
-            }
-          }
           try {
+            const buffer = await this.apiDownload(
+              `https://www.googleapis.com/drive/v3/files/${df.id}?alt=media`,
+              token
+            );
+            const dir = realPath.includes("/") ? realPath.substring(0, realPath.lastIndexOf("/")) : null;
+            if (dir) {
+              try {
+                await this.app.vault.createFolder(dir);
+              } catch (e) {
+              }
+            }
             const existing = this.app.vault.getAbstractFileByPath(realPath);
             if (existing instanceof import_obsidian.TFile)
               await this.app.vault.modifyBinary(existing, buffer);
@@ -361,6 +432,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
               await this.app.vault.createBinary(realPath, buffer);
             count++;
           } catch (e) {
+            console.error("Download error:", realPath, this.errMsg(e));
           }
         }));
         this.setStatus(`\u2B07\uFE0F ${count}/${driveFiles.length}...`);
@@ -369,7 +441,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice(`\u2705 Downloaded ${count} files from Google Drive!`);
     } catch (e) {
       this.setStatus("\u274C Download failed");
-      new import_obsidian.Notice("\u274C Download failed: " + e.message);
+      new import_obsidian.Notice("\u274C Download failed: " + this.errMsg(e));
     }
   }
   startAutoSync() {
