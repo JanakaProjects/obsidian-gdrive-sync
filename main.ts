@@ -7,7 +7,7 @@ import * as path from "path";
 
 const GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/manifest.json";
 const GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/main.js";
-const BATCH_SIZE = 5; // smaller batch for mobile stability
+const BATCH_SIZE = 5;
 
 interface GDriveSyncSettings {
   clientId: string;
@@ -65,7 +65,7 @@ export default class GDriveSyncPlugin extends Plugin {
 
   onunload() { this.stopAutoSync(); }
 
-  // ── Auto-Updater ────────────────────────────────────────────────────────
+  // ── Auto-Updater ───────────────────────────────────────────────────────
   async checkForUpdate() {
     try {
       const resp = await requestUrl({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
@@ -82,7 +82,6 @@ export default class GDriveSyncPlugin extends Plugin {
   async selfUpdate(newVersion: string) {
     try {
       let written = false;
-      // Try Node fs (desktop)
       try {
         // @ts-ignore
         const basePath = (this.app.vault.adapter as any).basePath;
@@ -93,7 +92,6 @@ export default class GDriveSyncPlugin extends Plugin {
         fs.writeFileSync(path.join(pluginDir, "manifest.json"), mResp.text, "utf8");
         written = true;
       } catch {}
-      // Fallback: vault adapter (mobile/iSH)
       if (!written) {
         const pluginPath = `.obsidian/plugins/${this.manifest.id}`;
         const jsResp = await requestUrl({ url: GITHUB_MAIN_JS_URL + "?t=" + Date.now() });
@@ -124,7 +122,7 @@ export default class GDriveSyncPlugin extends Plugin {
     await this.saveData({ ...current, lastSynced: this.lastSynced });
   }
 
-  // ── OAuth ─────────────────────────────────────────────────────────────────
+  // ── OAuth ────────────────────────────────────────────────────────────────
   async getAccessToken(): Promise<string> {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 60000) return this.accessToken;
     const resp = await fetch("https://oauth2.googleapis.com/token", {
@@ -161,28 +159,26 @@ export default class GDriveSyncPlugin extends Plugin {
     return this.driveFolderId;
   }
 
-  // ── List ALL files on Drive (handles pagination properly) ───────────────────
+  // ── List ALL files on Drive ─────────────────────────────────────────────────
   async listDriveFiles(): Promise<{id: string, name: string, modifiedTime: string}[]> {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
     let allFiles: any[] = [];
     let pageToken: string | null = null;
-    let page = 1;
 
     do {
+      // No pageSize limit — let Drive return as many as it can per page
       let url = `https://www.googleapis.com/drive/v3/files`
         + `?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}`
-        + `&fields=nextPageToken,files(id,name,modifiedTime)`
-        + `&pageSize=100`; // 100 per page — safe for all devices
+        + `&fields=nextPageToken,files(id,name,modifiedTime)`;
       if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
 
       const resp = await fetch(url, { headers: { Authorization: "Bearer " + token } });
-      if (!resp.ok) throw new Error(`Drive list failed page ${page}: ${resp.status}`);
+      if (!resp.ok) throw new Error(`Drive list failed: ${resp.status} ${await resp.text()}`);
       const data = await resp.json();
 
       allFiles = allFiles.concat(data.files || []);
       pageToken = data.nextPageToken || null;
-      page++;
     } while (pageToken);
 
     return allFiles;
@@ -197,7 +193,6 @@ export default class GDriveSyncPlugin extends Plugin {
     try {
       await this.ensureDriveFolder();
 
-      // Step 1: list ALL Drive files across all pages
       const driveFiles = await this.listDriveFiles();
       const driveMap: Record<string, {id: string, modifiedTime: number}> = {};
       for (const df of driveFiles) {
@@ -205,7 +200,6 @@ export default class GDriveSyncPlugin extends Plugin {
         driveMap[realPath] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
       }
 
-      // Step 2: download files newer on Drive
       const token = await this.getAccessToken();
       let downloaded = 0;
       const driveEntries = Object.entries(driveMap);
@@ -228,10 +222,9 @@ export default class GDriveSyncPlugin extends Plugin {
             } catch {}
           }
         }));
-        this.setStatus(`⬇️ ${downloaded} downloaded...`);
+        this.setStatus(`⬇️ ${downloaded}/${driveEntries.length}...`);
       }
 
-      // Step 3: upload local files newer than Drive
       const localFiles = this.app.vault.getFiles();
       const toUpload = localFiles.filter(f => {
         const driveInfo = driveMap[f.path];
@@ -243,7 +236,7 @@ export default class GDriveSyncPlugin extends Plugin {
         const batch = toUpload.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(f => this.uploadFile(f, true)));
         uploaded += batch.length;
-        this.setStatus(`⬆️ ${uploaded}/${toUpload.length} uploaded...`);
+        this.setStatus(`⬆️ ${uploaded}/${toUpload.length}...`);
       }
 
       await this.saveLastSynced();
